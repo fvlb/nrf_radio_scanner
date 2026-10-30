@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>nRF Radio Scanner</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header><div><h1>nRF Radio Scanner</h1><p>PCA10059 · receive-only RSSI sweep · 2400–2480 MHz</p></div><span id="status">Connecting…</span></header>
+  <section class="toolbar">
+    <label>Measurement <select id="mode"><option value="peak">Peak RSSI</option><option value="mean">Mean RSSI</option></select></label>
+    <label>Floor <input id="floor" type="number" value="-100" min="-127" max="-20"> dBm</label>
+    <label>Ceiling <input id="ceiling" type="number" value="-30" min="-100" max="0"> dBm</label>
+    <button id="pause">Pause display</button><button id="clear">Clear / reset max hold</button>
+    <a href="/capture.jsonl" download="scanner-capture.jsonl">Download recent sweeps</a>
+  </section>
+  <main>
+    <div class="plot"><h2>Received power <small>current trace + maximum hold</small></h2><canvas id="spectrum"></canvas></div>
+    <div class="plot"><h2>Waterfall <small>newest sweep at top · hover for frequency and power</small></h2><canvas id="waterfall"></canvas></div>
+    <div class="legend"><span>Low</span><div></div><span>High</span><span id="scale"></span></div>
+    <p id="stats">Waiting for measurements from the dongle…</p>
+    <p id="hover">Hover over the waterfall to inspect a bin.</p>
+    <aside><strong>This is a swept energy detector, not an I/Q SDR.</strong> Each column is measured at a different time. Short bursts may be missed. A 1 MHz tuning step is not 1 MHz spectral resolution. RSSI is approximate and limited near the receiver noise floor. Dashed markers: BLE advertising channels 37/38/39; shaded ranges: nominal Wi-Fi channels 1/6/11 (20 MHz).</aside>
+  </main>
+</body>
+</html>

@@ -1,0 +1,7 @@
+.deps/
+.venv/
+build/
+captures/
+__pycache__/
+.ruff_cache/
+*.pyc

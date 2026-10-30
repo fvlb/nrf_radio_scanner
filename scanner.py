@@ -16,6 +16,16 @@ from serial.tools import list_ports
 
 ROOT = Path(__file__).resolve().parent
 LOG = logging.getLogger("scanner")
+CONFIG_LIMITS = {"samples": (1, 64), "sample_interval_us": (0, 2000), "pause_ms": (0, 5000)}
+
+
+def validate_config(config):
+    if not isinstance(config, dict) or set(config) != set(CONFIG_LIMITS):
+        raise ValueError("Provide samples, sample_interval_us, and pause_ms")
+    for key, (low, high) in CONFIG_LIMITS.items():
+        if type(config[key]) is not int or not low <= config[key] <= high:
+            raise ValueError(f"{key} must be an integer between {low} and {high}")
+    return dict(config)
 
 
 def validate_frame(line):
@@ -28,8 +38,15 @@ def validate_frame(line):
             raise ValueError(f"Invalid {key}")
     if not 0 < frame["sweep_us"] < 60_000_000:
         raise ValueError("Invalid sweep duration")
-    if (frame.get("first_mhz"), frame.get("step_mhz"), frame.get("samples")) != (2400, 1, 16):
+    if (frame.get("first_mhz"), frame.get("step_mhz")) != (2400, 1):
         raise ValueError("Unexpected scanner configuration")
+    validate_config(
+        {
+            "samples": frame.get("samples"),
+            "sample_interval_us": frame.get("sample_interval_us", 128),
+            "pause_ms": frame.get("pause_ms", 0),
+        }
+    )
     for key in ("mean", "peak"):
         values = frame.get(key)
         if not isinstance(values, list) or len(values) != 81:
@@ -59,6 +76,54 @@ class State:
         self.status = "Waiting for scanner"
         self.port = None
         self.invalid = 0
+        self.requested_config = None
+        self.config_revision = 0
+
+    def request_config(self, config):
+        config = validate_config(config)
+        with self.condition:
+            self.requested_config = config
+            self.config_revision += 1
+            self.condition.notify_all()
+        return config
+
+    def next_config(self, sent_revision):
+        with self.condition:
+            if self.config_revision > sent_revision and self.requested_config is not None:
+                return self.config_revision, dict(self.requested_config)
+        return sent_revision, None
+
+    def status_fields(self):
+        """Caller holds condition; confirmation comes from device telemetry."""
+        latest = self.frames[-1] if self.frames else {}
+        applied = {key: latest.get(key) for key in CONFIG_LIMITS}
+        return {
+            "status": self.status,
+            "port": self.port,
+            "invalid_frames": self.invalid,
+            "requested_config": self.requested_config,
+            "applied_config": applied,
+            "config_pending": self.requested_config is not None
+            and applied != self.requested_config,
+        }
+
+    def stale_after(self):
+        with self.condition:
+            configs = [self.requested_config or {}]
+            if self.frames:
+                configs.append(self.frames[-1])
+            return max(
+                5,
+                *(
+                    2
+                    + 2
+                    * (
+                        c.get("samples", 16) * 81 * (c.get("sample_interval_us", 128) + 30) / 1e6
+                        + c.get("pause_ms", 0) / 1000
+                    )
+                    for c in configs
+                ),
+            )
 
     def update_status(self, text, port=None):
         with self.condition:
@@ -80,9 +145,7 @@ class State:
     def snapshot(self):
         with self.condition:
             return {
-                "status": self.status,
-                "port": self.port,
-                "invalid_frames": self.invalid,
+                **self.status_fields(),
                 "frames": list(self.frames),
             }
 
@@ -92,12 +155,23 @@ def acquire(state, stop, port, recording):
         try:
             device = port or discover_port()
             state.update_status("Connected, waiting for measurements", device)
-            with serial.Serial(device, 115200, timeout=1, exclusive=True) as stream:
+            with serial.Serial(
+                device, 115200, timeout=1, write_timeout=1, exclusive=True
+            ) as stream:
                 last_valid = time.monotonic()
+                sent_revision = -1
                 while not stop.is_set():
+                    revision, config = state.next_config(sent_revision)
+                    if config is not None:
+                        command = (
+                            f"C {config['samples']} {config['sample_interval_us']} "
+                            f"{config['pause_ms']}\n"
+                        ).encode()
+                        stream.write(command)
+                        sent_revision = revision
                     line = stream.read_until(b"\n", size=4096)
                     if not line:
-                        if time.monotonic() - last_valid > 5:
+                        if time.monotonic() - last_valid > state.stale_after():
                             state.update_status("Connected, no recent measurements", device)
                         continue
                     try:
@@ -151,6 +225,25 @@ def make_handler(state):
             self.end_headers()
             self.wfile.write(data)
 
+        def do_POST(self):
+            if self.path != "/api/config":
+                self.send_error(404)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 1024:
+                    raise ValueError("Expected a JSON configuration under 1024 bytes")
+                config = state.request_config(json.loads(self.rfile.read(length)))
+            except (ValueError, UnicodeError) as error:
+                self.send_error(400, str(error))
+                return
+            data = json.dumps({"requested_config": config}).encode()
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def events(self):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -166,11 +259,7 @@ def make_handler(state):
                         if state.counter <= last_id:
                             state.condition.wait(timeout=1)
                         frames = [frame for frame in state.frames if frame["id"] > last_id]
-                        status = {
-                            "status": state.status,
-                            "port": state.port,
-                            "invalid_frames": state.invalid,
-                        }
+                        status = state.status_fields()
                     for frame in frames:
                         payload = json.dumps(frame, separators=(",", ":"))
                         self.wfile.write(f"id: {frame['id']}\ndata: {payload}\n\n".encode())

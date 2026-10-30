@@ -13,6 +13,7 @@
 #include "app_usbd_cdc_acm.h"
 #include "app_usbd_core.h"
 #include "app_usbd_serial_num.h"
+#include "boards.h"
 #include "nrf.h"
 #include "nrf_delay.h"
 #include "nrf_drv_clock.h"
@@ -21,8 +22,6 @@
 #include "nrf_gpio.h"
 
 #define BIN_COUNT 81u
-#define SAMPLE_COUNT 16u
-#define SAMPLE_INTERVAL_US 128u
 #define LED_GREEN NRF_GPIO_PIN_MAP(0, 6)
 #define BUTTON NRF_GPIO_PIN_MAP(1, 6)
 
@@ -32,6 +31,42 @@ static bool boot_requested;
 static uint8_t rx_byte;
 static uint8_t packet[260] __attribute__((aligned(4)));
 static char tx_buffer[1200];
+static char command_buffer[48];
+static unsigned command_length;
+static bool command_overflow;
+
+typedef struct {
+    unsigned samples;
+    unsigned sample_interval_us;
+    unsigned pause_ms;
+} scan_config_t;
+
+static scan_config_t active_config = {16, 128, 0};
+static scan_config_t requested_config = {16, 128, 0};
+static bool config_pending;
+
+static void receive_command(uint8_t byte)
+{
+    if (byte == '\n') {
+        command_buffer[command_length] = '\0';
+        scan_config_t config;
+        char extra;
+        if (!command_overflow &&
+            sscanf(command_buffer, "C %u %u %u %c", &config.samples, &config.sample_interval_us,
+                   &config.pause_ms, &extra) == 3 &&
+            config.samples >= 1 && config.samples <= 64 && config.sample_interval_us <= 2000 &&
+            config.pause_ms <= 5000) {
+            requested_config = config;
+            config_pending = true;
+        }
+        command_length = 0;
+        command_overflow = false;
+    } else if (command_length < sizeof(command_buffer) - 1) {
+        command_buffer[command_length++] = (char)byte;
+    } else {
+        command_overflow = true;
+    }
+}
 
 static void cdc_handler(app_usbd_class_inst_t const *inst, app_usbd_cdc_acm_user_event_t event);
 
@@ -56,6 +91,8 @@ static void cdc_handler(app_usbd_class_inst_t const *inst, app_usbd_cdc_acm_user
     switch (event) {
     case APP_USBD_CDC_ACM_USER_EVT_PORT_OPEN:
         port_open = true;
+        command_length = 0;
+        command_overflow = false;
         (void)app_usbd_cdc_acm_read(&cdc, &rx_byte, 1);
         break;
     case APP_USBD_CDC_ACM_USER_EVT_PORT_CLOSE:
@@ -67,8 +104,10 @@ static void cdc_handler(app_usbd_class_inst_t const *inst, app_usbd_cdc_acm_user
         break;
     case APP_USBD_CDC_ACM_USER_EVT_RX_DONE:
         do {
-            if (rx_byte == 'b') {
+            if (rx_byte == 'b' && command_length == 0 && !command_overflow) {
                 boot_requested = true;
+            } else {
+                receive_command(rx_byte);
             }
         } while (app_usbd_cdc_acm_read(&cdc, &rx_byte, 1) == NRF_SUCCESS);
         break;
@@ -159,7 +198,7 @@ static bool measure_bin(uint32_t offset_mhz, int *mean, int *peak)
 
     int sum = 0;
     int strongest = -127;
-    for (unsigned sample = 0; sample < SAMPLE_COUNT; ++sample) {
+    for (unsigned sample = 0; sample < active_config.samples; ++sample) {
         /* An accidental address match may finish RX; keep receiving. */
         if (NRF_RADIO->EVENTS_END) {
             NRF_RADIO->EVENTS_END = 0;
@@ -175,10 +214,10 @@ static bool measure_bin(uint32_t offset_mhz, int *mean, int *peak)
         if (rssi > strongest) {
             strongest = rssi;
         }
-        nrf_delay_us(SAMPLE_INTERVAL_US);
+        nrf_delay_us(active_config.sample_interval_us);
         usb_process();
     }
-    *mean = sum / (int)SAMPLE_COUNT;
+    *mean = sum / (int)active_config.samples;
     *peak = strongest;
     return true;
 }
@@ -186,9 +225,11 @@ static bool measure_bin(uint32_t offset_mhz, int *mean, int *peak)
 static void enter_bootloader(void)
 {
     radio_disable();
-    /* Standard Nordic SDK PCA10059 bootloader enter-DFU marker. */
-    NRF_POWER->GPREGRET = 0xB1;
-    __DSB();
+    /* Stock PCA10059 Open DFU uses pin reset, not GPREGRET. P0.19 is wired
+     * to RESET; this is the SDK nrf_dfu_trigger_usb detach sequence. */
+    nrf_gpio_cfg_output(BSP_SELF_PINRESET_PIN);
+    nrf_gpio_pin_clear(BSP_SELF_PINRESET_PIN);
+    nrf_delay_ms(10);
     NVIC_SystemReset();
 }
 
@@ -220,6 +261,7 @@ int main(void)
 
     uint32_t sequence = 0;
     uint32_t button_since = 0;
+    uint32_t next_scan_at = now_us();
     while (true) {
         usb_process();
         if (nrf_gpio_pin_read(BUTTON) == 0) {
@@ -235,6 +277,15 @@ int main(void)
             enter_bootloader();
         }
         if (!port_open || tx_busy) {
+            continue;
+        }
+        if (config_pending) {
+            /* Never change sampling parameters partway through a sweep. */
+            active_config = requested_config;
+            config_pending = false;
+            next_scan_at = now_us();
+        }
+        if ((int32_t)(now_us() - next_scan_at) < 0) {
             continue;
         }
 
@@ -265,11 +316,14 @@ int main(void)
             NVIC_SystemReset();
         }
         uint32_t elapsed = now_us() - start;
+        next_scan_at = now_us() + active_config.pause_ms * 1000u;
         size_t pos = (size_t)snprintf(tx_buffer, sizeof(tx_buffer),
                                       "{\"v\":1,\"seq\":%lu,\"start_us\":%lu,\"sweep_us\":%lu,"
-                                      "\"first_mhz\":2400,\"step_mhz\":1,\"samples\":%u,\"mean\":[",
+                                      "\"first_mhz\":2400,\"step_mhz\":1,\"samples\":%u,"
+                                      "\"sample_interval_us\":%u,\"pause_ms\":%u,\"mean\":[",
                                       (unsigned long)sequence++, (unsigned long)start,
-                                      (unsigned long)elapsed, SAMPLE_COUNT);
+                                      (unsigned long)elapsed, active_config.samples,
+                                      active_config.sample_interval_us, active_config.pause_ms);
         for (unsigned bin = 0; bin < BIN_COUNT; ++bin) {
             pos += (size_t)snprintf(tx_buffer + pos, sizeof(tx_buffer) - pos, "%s%d",
                                     bin ? "," : "", means[bin]);

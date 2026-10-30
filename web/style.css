@@ -4,6 +4,8 @@ header { display: flex; justify-content: space-between; align-items: center; gap
 h1 { margin: 0; font-size: 29px; } p { color: #a6b5ca; }
 #status { border: 1px solid #40516c; padding: 10px 16px; border-radius: 8px; }
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 18px 0; }
+.timing { border-top: 1px solid #2d3b50; padding-top: 12px; }
+#timing-status { color: #a6b5ca; font-size: 12px; }
 label { white-space: nowrap; } input { width: 60px; }
 input, select, button { background: #202b3b; border: 1px solid #52657f; border-radius: 5px; color: #e2ebfa; padding: 7px; }
 button, a { cursor: pointer; } a { color: #80c9ff; }

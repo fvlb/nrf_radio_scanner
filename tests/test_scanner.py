@@ -2,13 +2,15 @@ import copy
 import json
 import os
 import pty
+import select
 import threading
 import time
 import unittest
 from http.server import ThreadingHTTPServer
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
-from scanner import State, acquire, make_handler, validate_frame
+from scanner import State, acquire, make_handler, validate_config, validate_frame
 from tools.build import verify_hex
 
 
@@ -27,6 +29,27 @@ def example():
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_timing_limits_and_invalid_values(self):
+        for samples, gap, pause in [(1, 0, 0), (64, 2000, 5000), (4, 16, 100)]:
+            config = {"samples": samples, "sample_interval_us": gap, "pause_ms": pause}
+            self.assertEqual(validate_config(config), config)
+            frame = {**example(), **config}
+            self.assertEqual(validate_frame(json.dumps(frame)), frame)
+        default = {"samples": 16, "sample_interval_us": 128, "pause_ms": 0}
+        for key, value in [
+            ("samples", 0),
+            ("samples", 65),
+            ("samples", True),
+            ("sample_interval_us", -1),
+            ("sample_interval_us", 2001),
+            ("pause_ms", 5001),
+            ("pause_ms", "100"),
+        ]:
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                validate_config({**default, key: value})
+        with self.assertRaises(ValueError):
+            validate_config({**default, "unexpected": 1})
+
     def test_image_validation_preserves_bootloader_and_uicr(self):
         def record(kind, address, payload):
             data = bytes([len(payload), address >> 8, address & 255, kind]) + payload
@@ -120,6 +143,33 @@ class IntegrationTests(unittest.TestCase):
                 self.assertIn(b"Waterfall", response.read())
             with urlopen(base + "/capture.jsonl", timeout=3) as response:
                 self.assertEqual(json.loads(response.readline())["seq"], 42)
+
+            config = {"samples": 4, "sample_interval_us": 16, "pause_ms": 100}
+            request = Request(
+                base + "/api/config",
+                data=json.dumps(config).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urlopen(request, timeout=3) as response:
+                self.assertEqual(response.status, 202)
+            self.assertTrue(state.snapshot()["config_pending"])
+            self.assertTrue(select.select([master], [], [], 3)[0])
+            self.assertEqual(os.read(master, 1024), b"C 4 16 100\n")
+            os.write(master, (json.dumps({**example(), **config, "seq": 43}) + "\n").encode())
+            deadline = time.monotonic() + 3
+            while state.counter < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(state.snapshot()["applied_config"], config)
+            self.assertFalse(state.snapshot()["config_pending"])
+            invalid = Request(
+                base + "/api/config",
+                data=b'{"samples":0}',
+                headers={"Content-Type": "application/json"},
+            )
+            with self.assertRaises(HTTPError) as rejected:
+                urlopen(invalid, timeout=3)
+            self.assertEqual(rejected.exception.code, 400)
+            self.assertEqual(state.snapshot()["requested_config"], config)
         finally:
             stop.set()
             server.shutdown()

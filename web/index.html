@@ -16,6 +16,14 @@
     <button id="pause">Pause display</button><button id="clear">Clear / reset max hold</button>
     <a href="/capture.jsonl" download="scanner-capture.jsonl">Download recent sweeps</a>
   </section>
+  <form id="timing" class="toolbar timing">
+    <strong>Scan timing</strong>
+    <label>Samples / frequency <input id="samples" type="number" value="16" min="1" max="64" required></label>
+    <label>Sample gap <input id="sample-gap" type="number" value="128" min="0" max="2000" required> µs</label>
+    <label>Pause between sweeps <input id="sweep-pause" type="number" value="0" min="0" max="5000" required> ms</label>
+    <button type="submit">Apply timing</button><button type="button" id="timing-defaults">Defaults</button>
+    <span id="timing-status">Applied timing will appear when the device sends a sweep.</span>
+  </form>
   <main>
     <div class="plot"><h2>Received power <small>current trace + maximum hold</small></h2><canvas id="spectrum"></canvas></div>
     <div class="plot"><h2>Waterfall <small>newest sweep at top · hover for frequency and power</small></h2><canvas id="waterfall"></canvas></div>

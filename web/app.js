@@ -6,6 +6,7 @@ let paused = false;
 let latest = null;
 let lastReceived = 0;
 let dirty = true;
+let timingInitialized = false;
 const palette = [[8, 10, 36], [22, 69, 160], [19, 181, 172], [239, 229, 87], [255, 82, 59]];
 
 function limits() {
@@ -124,15 +125,46 @@ events.onmessage = (event) => {
   frame[$("mode").value].forEach((value, i) => {maxHold[i] = Math.max(maxHold[i], value);});
   const highest = Math.max(...frame.peak);
   const frequency = 2400 + frame.peak.indexOf(highest);
-  $("stats").textContent = `Sweep #${frame.seq} · ${(frame.sweep_us / 1000).toFixed(1)} ms radio sweep · 81 bins · 16 samples/bin · strongest peak ${highest} dBm at ${frequency} MHz · ${new Date(frame.host_time * 1000).toLocaleTimeString()}`;
+  $("stats").textContent = `Sweep #${frame.seq} · ${(frame.sweep_us / 1000).toFixed(1)} ms radio sweep · 81 bins · ${frame.samples} samples/bin · strongest peak ${highest} dBm at ${frequency} MHz · ${new Date(frame.host_time * 1000).toLocaleTimeString()}`;
   dirty = true;
 };
 events.addEventListener("status", (event) => {
   const state = JSON.parse(event.data);
-  const stale = state.status === "Receiving" && Date.now() - lastReceived > 5000;
+  const c = state.requested_config || state.applied_config;
+  const expected = c && c.samples ? c.samples * 81 * ((c.sample_interval_us || 0) + 30) / 1000 + (c.pause_ms || 0) : 0;
+  const stale = state.status === "Receiving" && Date.now() - lastReceived > Math.max(5000, expected * 2 + 2000);
   $("status").textContent = `${paused ? "Display paused · " : ""}${stale ? "No recent measurements" : state.status}${state.port ? ` · ${state.port}` : ""} · ${state.invalid_frames} invalid`;
+  if (!timingInitialized && state.applied_config.sample_interval_us !== null) {
+    const initial = state.requested_config || state.applied_config;
+    $("samples").value = initial.samples;
+    $("sample-gap").value = initial.sample_interval_us;
+    $("sweep-pause").value = initial.pause_ms;
+    timingInitialized = true;
+  }
+  if (state.config_pending) {
+    $("timing-status").textContent = "Requested — waiting for a sweep with the new timing…";
+  } else if (state.applied_config.sample_interval_us !== null) {
+    const applied = state.applied_config;
+    $("timing-status").textContent = `Device reports: ${applied.samples} samples, ${applied.sample_interval_us} µs gap, ${applied.pause_ms} ms pause`;
+  }
 });
 events.onerror = () => {$("status").textContent = "Local server disconnected — reconnecting…";};
+$("timing").onsubmit = async (event) => {
+  event.preventDefault();
+  timingInitialized = true;
+  const config = {samples: Number($("samples").value), sample_interval_us: Number($("sample-gap").value), pause_ms: Number($("sweep-pause").value)};
+  try {
+    const response = await fetch("/api/config", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(config)});
+    if (!response.ok) throw new Error(`Server rejected timing (${response.status})`);
+    $("timing-status").textContent = "Requested — waiting for device confirmation…";
+  } catch (error) {
+    $("timing-status").textContent = error.message;
+  }
+};
+$("timing-defaults").onclick = () => {
+  $("samples").value = 16; $("sample-gap").value = 128; $("sweep-pause").value = 0;
+  $("timing").requestSubmit();
+};
 $("pause").onclick = () => {paused = !paused; $("pause").textContent = paused ? "Resume display" : "Pause display";};
 $("clear").onclick = () => {history.length = 0; maxHold.fill(-127); latest = null; dirty = true;};
 for (const id of ["mode", "floor", "ceiling"]) {

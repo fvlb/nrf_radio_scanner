@@ -4,12 +4,13 @@ A receive-only 2.4 GHz **swept RSSI energy detector** with a local browser
 waterfall. Detects energy without needing valid BLE packets. This is **not**
 a HackRF-style I/Q SDR or a simultaneous full-band capture.
 
-**Bring-up status (2026-10-30):** firmware builds and the serial/web integration
-checks pass. The initial image was accepted by the real dongle's USB DFU
-bootloader, but USB enumeration then timed out. A revised USB-startup image is
-built and awaits a physical RESET/reflash. Live RF measurements are not yet
-verified. The web server displays an explicit waiting/disconnected status;
-it does not substitute simulated data for measurements.
+**Hardware verified (2026-10-30):** flashed through the existing USB DFU
+bootloader and receiving real RSSI sweeps on a PCA10059. A continuous window of
+600 sweeps had no sequence gaps and zero invalid frames: approximately **184 ms
+per radio sweep / 5.26 sweeps per second** including USB delivery. The live
+browser spectrum/waterfall, peak/mean selection, pause/resume and hover readout
+were checked in Chrome with no JavaScript errors. These are live energy readings,
+not simulated data or calibrated spectrum-analyzer measurements.
 
 ## See the waterfall
 
@@ -91,6 +92,20 @@ After installation, hold the large **user button for one second**, or send `b`
 over the scanner serial port, to request the stock Nordic bootloader again.
 The physical RESET button remains the fallback. Stop the acquisition service
 before using the serial port with another tool.
+
+### USB troubleshooting
+
+If the red LED pulses but the bootloader does not appear as `1915:521f`, inspect
+`journalctl -k` and the USB connection. During hardware bring-up, the original
+hub connection produced USB descriptor timeouts (`-110`/`-71`), even in
+bootloader mode. Unplugging the dongle and reconnecting directly to another PC
+USB port restored bootloader enumeration. The revised application then flashed
+and enumerated as **nRF Radio Scanner** on `/dev/ttyACM0`.
+
+The page's **Scanner not found** state means the service is running but no
+scanner USB serial interface is present. Passing `--port` cannot fix a missing
+USB device. Once connected, acquisition resumes automatically; refresh the
+page if needed. Only one process should own the serial port.
 
 ## Investigation procedure
 
